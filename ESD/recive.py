@@ -1,14 +1,24 @@
-#! /usr/bin/python
+#! /usr/bin/python3
 from scapy.all import *
-import logging
 
 
-def prn(packet):
-    llist = []
-    for x in range(packet[DNS].ancount):
-        llist.append(packet[DNS].an[x].rdata)
-    print(packet[DNS].qd.qname.decode('utf-8'))
-    return llist
+def add(x, y):
+    return x + y
 
+def apply_async(func, args, *, callback):
+    # Compute the result
+    result = func(*args)
+    # Invoke the callback with the result
+    callback(result)
 
-sniff(prn=prn, lfilter=lambda x: x.haslayer(DNS) and x[DNS].an != None and x[DNS].qd.qname.decode('utf-8') == 'baidu.com.')
+def make_handler():
+    sequence = 0
+    def handler(result):
+        nonlocal sequence
+        sequence += 1
+        print('[{}] Got: {}'.format(sequence, result))
+    print(sequence)
+    return handler
+
+handler = make_handler()
+apply_async(add, (2, 3), callback=handler)

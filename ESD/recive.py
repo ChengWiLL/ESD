@@ -1,24 +1,72 @@
-#! /usr/bin/python3
-from scapy.all import *
+import socket
+import threading
+from socket import socket
 
 
-def add(x, y):
-    return x + y
+class ChannelThread(threading.Thread):
+    def __init__(self):
+        threading.Thread.__init__(self)
 
-def apply_async(func, args, *, callback):
-    # Compute the result
-    result = func(*args)
-    # Invoke the callback with the result
-    callback(result)
+        self.clients = []
+        self.chan_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.chan_sock.bind(('', 0))
+        _, self.port = self.chan_sock.getsockname()
+        self.chan_sock.listen(5)
+        self.daemon = True
+        self.start()
 
-def make_handler():
-    sequence = 0
-    def handler(result):
-        nonlocal sequence
-        sequence += 1
-        print('[{}] Got: {}'.format(sequence, result))
-    print(sequence)
-    return handler
+    def run(self):
+        while True:
+            new_client = self.chan_sock.accept()
+            if not new_client:
+                break
+            self.clients.append(new_client)
 
-handler = make_handler()
-apply_async(add, (2, 3), callback=handler)
+    def sendall(self, msg):
+        for client in self.clients:
+            client[0].sendall(msg)
+
+
+class Channel(threading.Thread):
+
+    def __init__(self):
+        threading.Thread.__init__(self)
+
+        self.daemon = True
+        self.channel_thread = ChannelThread()
+
+    def public_address(self):
+        return "tcp://%s:%d" % (socket.gethostname(), self.channel_thread.port)
+
+    def register(self, channel_address, update_callback):
+        host, s_port = channel_address.split("//")[-1].split(":")
+        port = int(s_port)
+        self.peer_chan_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.peer_chan_sock.connect((host, port))
+        self._callback = update_callback
+        self.start()
+
+    def deal_with_message(self, msg):
+        self._callback(msg)
+
+    def run(self):
+        data = ""
+        while True:
+            new_data = self.peer_chan_sock.recv(1024)
+            if not new_data:
+                # connection reset by peer
+                break
+            data += new_data
+            msgs = data.split("\n\n")
+            if msgs[-1]:
+                data = msgs.pop()
+            for msg in msgs:
+                self.deal_with_message(msg)
+
+    def send_value(self, channel_value):
+        self.channel_thread.sendall("%s\n\n" % channel_value)
+
+
+if __name__ == "__main__":
+    c = Channel()
+    c.public_address()

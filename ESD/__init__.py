@@ -131,14 +131,12 @@ class DNSQuery(object):
             final_list = domain_list + final_list
         # 递归调用，在子域名的dns记录中查找新的子域名
         recursive = []
-        # print("before: {0}".format(final_list))
-        # print("self.sub_domain: {0}".format(self.sub_domains))
         final_list = list(set(final_list).difference(set(self.sub_domains)))
-        # print("after: {0}".format(final_list))
         if final_list:
             d = DNSQuery('', final_list, self.suffix)
             recursive = d.dns_query()
         return final_list + recursive
+
 
 # 接收进程
 class Recive(multiprocessing.Process):
@@ -156,7 +154,7 @@ class Recive(multiprocessing.Process):
         def prn(packet):
             qname = packet[DNS].qd.qname.decode('utf-8')
             sub = ''.join(qname.rsplit(self.domain, 1)).rstrip('.')
-            if packet[DNS].an != None:
+            if self.domain in qname:
                 domain_ips = []
                 for x in range(packet[DNS].ancount):
                     if not isinstance(packet[DNS].an[x].rdata, bytes):
@@ -170,7 +168,7 @@ class Recive(multiprocessing.Process):
                     if sub != self.wildcard_sub:
                         self.data[qname] = domain_ips
                         logger.info('{sub} {ips}'.format(sub=qname, ips=domain_ips))
-        sniff(count=self.count, prn=prn, lfilter=lambda x: x.haslayer(DNS) and self.domain in x[DNS].qd.qname.decode('utf-8'), store=0)
+        sniff(count=self.count, prn=prn, lfilter=lambda x: x.haslayer(DNS) and x[DNS].qd != None and x[DNS].an != None)
 
 
 class DNSTransfer(object):
@@ -645,7 +643,7 @@ class EnumSubDomain(object):
             sub = ''.join(sub.rsplit(self.domain, 1)).rstrip('.')
             sub_domain = '{sub}.{domain}'.format(sub=sub, domain=self.domain)
         try:
-            send(IP(dst="114.114.114.114")/UDP(dport=53)/DNS(rd=1, qd=DNSQR(qname=sub_domain, qtype='A', qclass='IN')), verbose=0)
+            send(IP(dst="114.114.114.114") / UDP(sport=random.randint(1024, 2000), dport=53) / DNS(rd=1, qd=DNSQR(qname=sub_domain, qtype='A', qclass='IN')), verbose=0)
         except Exception as e:
             logger.info(sub_domain)
             logger.warning(traceback.format_exc())
@@ -868,6 +866,7 @@ class EnumSubDomain(object):
             t.start()
             job = self.query(self.wildcard_sub)
             self.loop.run_until_complete(job)
+            t.join()
             sub = self.wildcard_sub + self.domain
             ret = self.data[sub] if sub in self.data else None
             logger.info('@{dns} {sub} {ips}'.format(dns=dns, sub=sub, ips=ret))
@@ -966,7 +965,7 @@ class EnumSubDomain(object):
             logger.info('Search engines subdomain count: {subdomains_count}'.format(subdomains_count=len(subdomains)))
 
         total_subs = set(subs + dnspod_domains + list(subdomains) + transfer_info + ca_subdomains)
-        # use TXT,SOA,MX,AAAA record to find sub domains
+        # Use TXT,SOA,MX,AAAA record to find sub domains
         if self.multiresolve:
             logger.info('Enumerating subdomains with TXT, SOA, MX, AAAA record...')
             dnsquery = DNSQuery(self.domain, total_subs, self.domain)
@@ -1125,7 +1124,7 @@ def main():
     if 'esd' in os.environ:
         debug = os.environ['esd']
     else:
-        debug = True
+        debug = False
     logger.info('Debug: {d}'.format(d=debug))
     logger.info('--skip-rsc: {rsc}'.format(rsc=skip_rsc))
 

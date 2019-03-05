@@ -1,6 +1,5 @@
 import socket
 import threading
-from socket import socket
 
 
 class ChannelThread(threading.Thread):
@@ -28,7 +27,6 @@ class ChannelThread(threading.Thread):
 
 
 class Channel(threading.Thread):
-
     def __init__(self):
         threading.Thread.__init__(self)
 
@@ -65,8 +63,3 @@ class Channel(threading.Thread):
 
     def send_value(self, channel_value):
         self.channel_thread.sendall("%s\n\n" % channel_value)
-
-
-if __name__ == "__main__":
-    c = Channel()
-    c.public_address()

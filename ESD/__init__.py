@@ -37,6 +37,11 @@ import dns.resolver
 import multiprocessing
 import threading
 import tldextract
+import json
+import configparser
+import base64
+from shodan import Shodan
+from shodan.cli.helpers import get_api_key
 from optparse import OptionParser
 import urllib.parse as urlparse
 from collections import Counter
@@ -44,7 +49,7 @@ from aiohttp.resolver import AsyncResolver
 from itertools import islice
 from difflib import SequenceMatcher
 
-__version__ = '0.0.22'
+__version__ = '0.0.24'
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -73,6 +78,7 @@ ssl.match_hostname = lambda cert, hostname: True
 
 
 # 只采用了递归，速度非常慢，在优化完成前不建议开启
+# TODO:优化DNS查询，递归太慢了
 class DNSQuery(object):
     def __init__(self, root_domain, subs, suffix):
         # root domain
@@ -212,6 +218,87 @@ class CAInfo(object):
         for sub in subdomain_list:
             subs.append(sub[:len(sub) - len(self.domain) - 1])
         return subs
+
+
+# 使用shodan接口进行枚举，但经测试并不能增加多少成果
+class ShodanEngine(object):
+    def __init__(self, skey, conf, domain):
+        self.domain = domain
+        self.conf = conf
+        self.skey = skey
+        self.api = None
+
+    # 初始化shodan的api
+    def initialize(self):
+        if self.skey:
+            logger.info('Initializing the shodan api.')
+            result = os.system('shodan init {skey}'.format(skey=self.skey))
+            if result:
+                logger.warning('Initializ failed, please check your key.')
+                return False
+            self.conf.set("shodan", "shodan_key", self.skey)
+            self.conf.write(open("key.ini", "w"))
+            self.api = Shodan(get_api_key())
+        elif get_api_key():
+            self.api = Shodan(get_api_key())
+        else:
+            logger.warning('The shodan api is empty so you can not use shodan api.')
+            return False
+        return True
+
+    def search(self):
+        # 如果不充钱，最多只能查25条，但即使是付费玩家最多也只能查10000条
+        limit = 10000
+        subs = list()
+        result = self.api.search('hostname:{domain}'.format(domain=self.domain))
+        for service in result['matches']:
+            domain = service['hostnames'][0]
+            subs.append(domain[:domain.find('.')])
+        return set(subs)
+
+
+# fofa太落后了，sdk不支持python3，就只能调用restful api了，但是挖掘成果比shodan多
+class FofaEngine(object):
+    def __init__(self, fofa_struct, conf, domain):
+        self.base_url = "https://fofa.so/api/v1/search/all?email={email}&key={key}&qbase64={domain}"
+        self.email = fofa_struct['femail']
+        self.fkey = fofa_struct['fkey']
+        self.domain = base64.b64encode(domain.encode('utf-8')).decode('utf-8')
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.8',
+            'Accept-Encoding': 'gzip',
+        }
+        self.timeout = 30
+        self.conf = conf
+
+    def initialize(self):
+        if self.fkey is not None and self.email is not None:
+            self.conf.set("fofa", "fofa_key", self.fkey)
+            self.conf.set("fofa", "fofa_email", self.email)
+            self.conf.write(open("key.ini", "w"))
+            return True
+        else:
+            self.fkey = self.conf.items("fofa")[0][1]
+            self.email = self.conf.items("fofa")[1][1]
+            return True
+        return False
+
+    def search(self):
+        result = list()
+        url = self.base_url.format(email=self.email, key=self.fkey, domain=self.domain)
+        try:
+            resp = requests.Session().get(url, headers=self.headers, timeout=self.timeout)
+            json_resp = json.loads(resp.text)
+            for res in json_resp['results']:
+                domain = urlparse.urlparse(res[0]).netloc
+                result.append(domain[:domain.find('.')])
+        except Exception as e:
+            print(str(e))
+            result = []
+
+        return result
 
 
 class EngineBase(multiprocessing.Process):
@@ -456,7 +543,7 @@ class Baidu(EngineBase):
 
 
 class EnumSubDomain(object):
-    def __init__(self, domain, response_filter=None, dns_servers=None, skip_rsc=False, debug=False, split=None, engines=[Baidu, Google, Bing, Yahoo], proxy={}, brute=True, transfer=True, cainfo=True, multiresolve=False):
+    def __init__(self, domain, response_filter=None, dns_servers=None, skip_rsc=False, debug=False, split=None, engines=[Baidu, Google, Bing, Yahoo], proxy={}, brute=True, transfer=True, cainfo=True, multiresolve=False, shodan_key=None, fofa={}):
         self.project_directory = os.path.abspath(os.path.dirname(__file__))
         logger.info('Version: {v}'.format(v=__version__))
         logger.info('----------')
@@ -471,6 +558,9 @@ class EnumSubDomain(object):
         self.transfer = transfer
         self.cainfo = cainfo
         self.multiresolve = multiresolve
+        self.skey = shodan_key
+        self.fofa_struct = fofa
+        self.conf = configparser.ConfigParser()
         self.stable_dns_servers = ['1.1.1.1', '223.5.5.5']
         if dns_servers is None:
             dns_servers = [
@@ -585,8 +675,7 @@ class EnumSubDomain(object):
                     line = line.strip('.')
                     dicts.append(line)
         dicts = list(set(dicts))
-        # root domain
-        dicts.append('@')
+
         # split dict
         if self.split is not None:
             s = self.split.split('/')
@@ -595,6 +684,9 @@ class EnumSubDomain(object):
             dicts_every = int(math.ceil(len(dicts) / dicts_count))
             dicts = [dicts[i:i + dicts_every] for i in range(0, len(dicts), dicts_every)][dicts_choose - 1]
             logger.info('Sub domain dict split {count} and get {choose}st'.format(count=dicts_count, choose=dicts_choose))
+
+        # root domain
+        dicts.append('@')
 
         return dicts
 
@@ -915,6 +1007,9 @@ class EnumSubDomain(object):
                     self.wildcard_html = self.wildcard_html3 = ''
                     self.wildcard_html_len = self.wildcard_html3_len = 0
                     logger.warning('Request response content timeout, {w_sub}.{domain} and {w_sub3}.{domain} maybe not a http service, content will be set to blank!'.format(w_sub=self.wildcard_sub, domain=self.domain, w_sub3=self.wildcard_sub3))
+                except requests.exceptions.ConnectionError:
+                    logger.error('ESD can\'t get the response text so the rsc will be skipped. ')
+                    self.skip_rsc = True
         else:
             logger.info('Not a wildcard domain')
 
@@ -966,8 +1061,34 @@ class EnumSubDomain(object):
                 self.loop.run_until_complete(self.start(tasks))
             logger.info('Search engines subdomain count: {subdomains_count}'.format(subdomains_count=len(subdomains)))
 
-        total_subs = set(subs + dnspod_domains + list(subdomains) + transfer_info + ca_subdomains)
-        # use TXT,SOA,MX,AAAA record to find sub domains
+        # Use shodan to enumerate subdomains (need key and money)
+        shodan_result = []
+        self.conf.read("key.ini")
+        shodan = ShodanEngine(self.skey, self.conf, self.domain)
+        is_success = shodan.initialize()
+        if is_success:
+            logger.info('Enumerating subdomains with Shodan')
+            shodan_result = shodan.search()
+            if len(shodan_result):
+                tasks = (self.query(sub) for sub in shodan_result)
+                self.loop.run_until_complete(self.start(tasks))
+            logger.info("Shodan subdomain count: {subdomains_count}".format(subdomains_count=len(shodan_result)))
+
+        # Use fofa to enumerate subdomains (need key and money)
+        fofa_result = []
+        fofa = FofaEngine(self.fofa_struct, self.conf, self.domain)
+        is_success = fofa.initialize()
+        if is_success:
+            logger.info("Enumerating subdomains with Fofa")
+            fofa_result = fofa.search()
+            if len(fofa_result):
+                tasks = (self.query(sub) for sub in fofa_result)
+                self.loop.run_until_complete(self.start(tasks))
+            logger.info("Fofa subdomain count: {subdomains_count}".format(subdomains_count=len(fofa_result)))
+
+        total_subs = set(subs + dnspod_domains + list(subdomains) + transfer_info + ca_subdomains + list(shodan_result) + fofa_result)
+
+        # Use TXT,SOA,MX,AAAA record to find sub domains
         if self.multiresolve:
             logger.info('Enumerating subdomains with TXT, SOA, MX, AAAA record...')
             dnsquery = DNSQuery(self.domain, total_subs, self.domain)
@@ -1023,13 +1144,13 @@ class EnumSubDomain(object):
                 op.write(con)
                 opt.write(con)
 
-
         logger.info('Output: {op}'.format(op=output_path))
         logger.info('Output with time: {op}'.format(op=output_path_with_time))
         logger.info('Total domain: {td}'.format(td=len(self.data)))
         time_consume = int(time.time() - start_time)
         logger.info('Time consume: {tc}'.format(tc=str(datetime.timedelta(seconds=time_consume))))
         return self.data
+
 
 def banner():
     print("""\033[94m
@@ -1057,6 +1178,9 @@ def main():
     parser.add_option('-t', '--dns-transfer', dest='transfer', help='Use DNS Transfer vulnerability to find subdomains', action='store_true', default=False)
     parser.add_option('-c', '--ca-info', dest='cainfo', help='Use CA info to find subdomains', action='store_true', default=False)
     parser.add_option('-m', '--multi-resolve', dest='multiresolve', help='Use TXT, AAAA, MX, SOA record to find subdomains', action='store_true', default=False)
+    parser.add_option('--skey', '--shodan-key', dest='shodankey', help='Define the api of shodan')
+    parser.add_option('--fkey', '--fofa-key', dest='fofakey', help='Define the key of fofa')
+    parser.add_option('--femail', '--fofa-email', dest='fofaemail', help='The email of your fofa account')
     (options, args) = parser.parse_args()
 
     support_engines = {
@@ -1076,6 +1200,11 @@ def main():
     dns_transfer = options.transfer
     ca_info = options.cainfo
     multiresolve = options.multiresolve
+    skey = options.shodankey
+    fofa_struct = {
+        'fkey': options.fofakey,
+        'femail': options.fofaemail,
+    }
 
     try:
         if len(split_list) != 2 or int(split_list[0]) > int(split_list[1]):
@@ -1084,7 +1213,6 @@ def main():
     except:
         logger.error('Split validation failed: {d}'.format(d=split_list))
         exit(0)
-
 
     if options.proxy:
         proxy = {
@@ -1099,7 +1227,7 @@ def main():
             if engine.lower() in support_engines:
                 engines.append(support_engines[engine])
     else:
-        engines = [Baidu,Google,Bing,Yahoo]
+        engines = [Baidu, Google, Bing, Yahoo]
 
     if options.domains is not None:
         for p in options.domains.split(','):
@@ -1131,7 +1259,7 @@ def main():
     logger.info('Total target domains: {ttd}'.format(ttd=len(domains)))
     try:
         for d in domains:
-            esd = EnumSubDomain(d, response_filter, skip_rsc=skip_rsc, debug=debug, split=split, engines=engines, proxy=proxy, brute=brute, transfer=dns_transfer, cainfo=ca_info, multiresolve=multiresolve)
+            esd = EnumSubDomain(d, response_filter, skip_rsc=skip_rsc, debug=debug, split=split, engines=engines, proxy=proxy, brute=brute, transfer=dns_transfer, cainfo=ca_info, multiresolve=multiresolve, shodan_key=skey, fofa=fofa_struct)
             esd.run()
     except KeyboardInterrupt:
         logger.info('Bye :)')
